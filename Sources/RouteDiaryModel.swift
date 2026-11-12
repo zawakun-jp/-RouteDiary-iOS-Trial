@@ -31,6 +31,10 @@ final class RouteDiaryModel: ObservableObject {
     var distanceMeters: Double { points.reduce(0) { $0 + $1.segment } }
     var staySeconds: TimeInterval { stays.reduce(0) { $0 + $1.duration } }
     var excludedSeconds: TimeInterval { zoneVisits.reduce(0) { $0 + $1.duration } }
+    var currentStaySeconds: TimeInterval {
+        guard recorder.recording, let started = recorder.currentStayStart else { return 0 }
+        return max(0, Date().timeIntervalSince(started))
+    }
     var isTodaySelected: Bool { Calendar.current.isDateInToday(selectedDay) }
 
     func refresh() {

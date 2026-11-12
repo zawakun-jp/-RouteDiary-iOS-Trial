@@ -12,6 +12,9 @@ final class LocationRecorder: NSObject, ObservableObject, CLLocationManagerDeleg
     @Published private(set) var speedKmh: Double?
     @Published private(set) var isWithinExcludedZone = false
     @Published private(set) var lastSavedAt: Date?
+    @Published private(set) var headingDegrees: Double?
+    @Published private(set) var currentStayStart: Date?
+    private var headingEnabled = false
 
     var onDataChanged: (() -> Void)?
     private let manager = CLLocationManager()
@@ -35,6 +38,7 @@ final class LocationRecorder: NSObject, ObservableObject, CLLocationManagerDeleg
         manager.distanceFilter = kCLDistanceFilterNone
         manager.activityType = .fitness
         manager.pausesLocationUpdatesAutomatically = false
+        manager.headingFilter = 2
     }
 
     func start() {
@@ -59,10 +63,11 @@ final class LocationRecorder: NSObject, ObservableObject, CLLocationManagerDeleg
         pendingStart = false
         do { zonesCache = try store.zones() }
         catch { status = "除外エリア取得失敗: \(error.localizedDescription)"; return }
-        anchor = nil; anchorTime = nil; dwellStartedAt = nil; lastSavedAtSession = nil
+        anchor = nil; anchorTime = nil; dwellStartedAt = nil; currentStayStart = nil; lastSavedAtSession = nil
         lastGoodFix = nil; gapPending = false; zoneVisit = nil
         isWithinExcludedZone = false
         recording = true
+        RDLog.write("GPS recording started")
         status = "GPS測位待ち（新しい測位まで記録なし）"
         // plist UIBackgroundModes=location がある状態でのみtrueにできます。
         manager.allowsBackgroundLocationUpdates = true
@@ -81,6 +86,7 @@ final class LocationRecorder: NSObject, ObservableObject, CLLocationManagerDeleg
         manager.stopUpdatingLocation()
         manager.allowsBackgroundLocationUpdates = false
         recording = false
+        RDLog.write("GPS recording stopped")
         status = "停止中"
         isWithinExcludedZone = false
         anchor = nil; anchorTime = nil; dwellStartedAt = nil
@@ -115,7 +121,7 @@ final class LocationRecorder: NSObject, ObservableObject, CLLocationManagerDeleg
     }
 
     func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
-        if recording { status = "GPS取得エラー（再測位待ち）" }
+        if recording { status = "GPS取得エラー（再測位待ち）"; RDLog.write("GPS error code=\((error as NSError).code)") }
         else { status = "現在地を取得できません: \(error.localizedDescription)" }
     }
 
@@ -132,6 +138,18 @@ final class LocationRecorder: NSObject, ObservableObject, CLLocationManagerDeleg
         pendingOneShot = false
     }
 
+    func setCompassEnabled(_ enabled: Bool) {
+        headingEnabled = enabled
+        if enabled && CLLocationManager.headingAvailable() { manager.startUpdatingHeading() }
+        else { manager.stopUpdatingHeading(); headingDegrees = nil }
+    }
+
+    func locationManager(_ manager: CLLocationManager, didUpdateHeading heading: CLHeading) {
+        guard headingEnabled, heading.headingAccuracy >= 0 else { return }
+        let degrees = heading.trueHeading >= 0 ? heading.trueHeading : heading.magneticHeading
+        if degrees.isFinite { headingDegrees = degrees }
+    }
+
     private func process(_ fix: CLLocation) {
         if let lastGoodFix, fix.timestamp <= lastGoodFix { return }
         let now = fix.timestamp
@@ -140,7 +158,7 @@ final class LocationRecorder: NSObject, ObservableObject, CLLocationManagerDeleg
             // GPS欠損中の移動距離・滞在時間は推定しません。
             closeVisit()
             gapPending = anchor != nil
-            dwellStartedAt = now
+            dwellStartedAt = now; currentStayStart = nil
             status = "GPS途切れ後に復帰（欠損区間を除外）"
         }
         lastGoodFix = now
@@ -162,14 +180,14 @@ final class LocationRecorder: NSObject, ObservableObject, CLLocationManagerDeleg
                 saveQuietly { try store.updateZoneVisit(zoneID: zone.id, title: zone.title, start: visit.entered, end: now) }
             }
             gapPending = anchor != nil
-            dwellStartedAt = now
+            dwellStartedAt = now; currentStayStart = nil
             status = "記録除外エリア内: \(zone.title)"
             return
         }
 
         let justExited = zoneVisit != nil
         if justExited {
-            closeVisit(); gapPending = anchor != nil; dwellStartedAt = now
+            closeVisit(); gapPending = anchor != nil; dwellStartedAt = now; currentStayStart = nil
         }
         isWithinExcludedZone = false
         let trustworthySpeed: Double? = {
@@ -184,13 +202,14 @@ final class LocationRecorder: NSObject, ObservableObject, CLLocationManagerDeleg
 
         guard let previous = anchor, let saved = lastSavedAtSession else {
             savePoint(fix, segment: 0, speed: trustworthySpeed, peak: peak, gap: false)
-            dwellStartedAt = now
+            dwellStartedAt = now; currentStayStart = nil
             return
         }
         let displacement = previous.distance(from: fix)
         let interval = now.timeIntervalSince(saved)
         if !gapPending && !justExited && displacement < distanceThreshold {
             if dwellStartedAt == nil { dwellStartedAt = now }
+            currentStayStart = dwellStartedAt
             if let dwellStartedAt, now.timeIntervalSince(dwellStartedAt) >= stayThreshold,
                let anchorTime {
                 saveQuietly { try store.updateStay(anchor: anchorTime, start: dwellStartedAt, end: now,
@@ -205,7 +224,7 @@ final class LocationRecorder: NSObject, ObservableObject, CLLocationManagerDeleg
             return
         }
         savePoint(fix, segment: gapPending ? 0 : displacement, speed: trustworthySpeed, peak: peak, gap: gapPending)
-        dwellStartedAt = now
+        dwellStartedAt = now; currentStayStart = nil
         gapPending = false
     }
 

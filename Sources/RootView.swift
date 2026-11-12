@@ -5,18 +5,30 @@ import UniformTypeIdentifiers
 
 struct RootView: View {
     @ObservedObject var model: RouteDiaryModel
+    @StateObject private var dashboard = DashboardSettings()
+    @StateObject private var cloud = CloudClient()
+    @AppStorage("appDarkMode") private var dark = false
+    @AppStorage("appLanguage") private var language = "ja"
     @State private var tab = 0
+
     var body: some View {
         TabView(selection: $tab) {
             NavigationStack { DiaryMapView(model: model) }
-                .tabItem { Label("地図", systemImage: "map") }.tag(0)
+                .tabItem { Label(rd("地図"), systemImage: "map") }.tag(0)
             NavigationStack { HistoryView(model: model) }
-                .tabItem { Label("履歴", systemImage: "clock.arrow.circlepath") }.tag(1)
+                .tabItem { Label(rd("履歴"), systemImage: "clock.arrow.circlepath") }.tag(1)
             NavigationStack { PrivacyZonesView(model: model) }
-                .tabItem { Label("除外", systemImage: "eye.slash") }.tag(2)
+                .tabItem { Label(rd("除外"), systemImage: "eye.slash") }.tag(2)
+            NavigationStack { CloudBackupView(model: model) }
+                .tabItem { Label(rd("クラウド"), systemImage: "icloud") }.tag(3)
             NavigationStack { SettingsView(model: model) }
-                .tabItem { Label("設定", systemImage: "gearshape") }.tag(3)
+                .tabItem { Label(rd("設定"), systemImage: "gearshape") }.tag(4)
         }
+        .environmentObject(dashboard)
+        .environmentObject(cloud)
+        .preferredColorScheme(dark ? .dark : .light)
+        .environment(\.locale, Locale(identifier: language == "zh" ? "zh_Hans" : language == "en" ? "en" : "ja"))
+        .id(language)
         .alert("RouteDiary", isPresented: Binding(
             get: { model.message != nil }, set: { if !$0 { model.message = nil } })) {
                 Button("OK", role: .cancel) { model.message = nil }
@@ -24,47 +36,60 @@ struct RootView: View {
         .onReceive(Timer.publish(every: 15, on: .main, in: .common).autoconnect()) { _ in
             model.refreshForMidnight()
         }
+        .task { if cloud.signedIn { await cloud.refreshAvatar() } }
     }
 }
 
 struct DailyMetricsView: View {
     @ObservedObject var model: RouteDiaryModel
-    var body: some View {
-        VStack(spacing: 9) {
-            HStack {
-                DatePicker("表示日", selection: $model.selectedDay, in: ...Date(), displayedComponents: .date)
-                    .datePickerStyle(.compact)
-                Spacer()
-                Button("今日") { model.selectedDay = Date() }
-                    .font(.caption)
-            }
-            HStack(spacing: 6) {
-                metric("移動距離", String(format: "%.2f km", model.distanceMeters / 1000))
-                metric("滞在", model.staySeconds.durationLabel)
-                metric("最高速度", String(format: "%.1f km/h", (model.maxSpeed?.metersPerSecond ?? 0) * 3.6))
-            }
-            HStack {
-                Label("除外エリア滞在: \(model.excludedSeconds.durationLabel)", systemImage: "eye.slash")
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Text("\(model.points.count)地点").foregroundStyle(.secondary)
-            }.font(.caption)
+    @EnvironmentObject private var dashboard: DashboardSettings
+
+    private func metricValue(_ id: String) -> String {
+        switch id {
+        case "points": return "\(model.points.count)"
+        case "distance": return String(format: "%.2f km", model.distanceMeters / 1000)
+        case "peak": return String(format: "%.1f km/h", (model.maxSpeed?.metersPerSecond ?? 0) * 3.6)
+        case "stay": return "\(model.staySeconds.durationLabel) / \(model.stays.count)回"
+        case "current_stay": return model.currentStaySeconds.durationLabel
+        case "zone_total": return model.excludedSeconds.durationLabel
+        default: return ""
         }
     }
-    private func metric(_ title: String, _ value: String) -> some View {
-        VStack(spacing: 3) {
-            Text(title).font(.caption2).foregroundStyle(.secondary)
-            Text(value).font(.subheadline).fontWeight(.semibold).minimumScaleFactor(0.75).lineLimit(1)
+    var body: some View {
+        VStack(spacing: 8) {
+            HStack {
+                DatePicker(rd("表示日"), selection: $model.selectedDay, in: ...Date(), displayedComponents: .date)
+                    .datePickerStyle(.compact)
+                Spacer()
+                Button(rd("今日")) { model.selectedDay = Date() }.font(.caption)
+            }
+            let visible = dashboard.entries.filter { $0.visible }
+            if !visible.isEmpty {
+                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())], spacing: 6) {
+                    ForEach(visible) { entry in
+                        VStack(spacing: 3) {
+                            Text(DashboardSettings.label(entry.id)).font(.system(size: 10)).foregroundStyle(.secondary)
+                                .lineLimit(2).multilineTextAlignment(.center)
+                            Text(metricValue(entry.id)).font(.system(size: 12, weight: .semibold))
+                                .minimumScaleFactor(0.65).lineLimit(1)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .frame(minHeight: 40)
+                        .padding(.horizontal, 3)
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+                    }
+                }
+            }
         }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 7)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 9))
     }
 }
 
 struct DiaryMapView: View {
     @ObservedObject var model: RouteDiaryModel
     @ObservedObject private var recorder: LocationRecorder
+    @EnvironmentObject private var cloud: CloudClient
+    @AppStorage("recordPinsVisible") private var showPins = true
+    @AppStorage("liveMarkerAvatar") private var useAvatar = false
     @AppStorage("mapSatellite") private var satellite = false
     @State private var camera: MapCameraPosition = .region(MKCoordinateRegion(
         center: CLLocationCoordinate2D(latitude: 35.6812, longitude: 139.7671),
@@ -72,6 +97,9 @@ struct DiaryMapView: View {
     @State private var following = false
     @State private var didAutoCenter = false
     @State private var chooseZone = false
+    @State private var compassEnabled = false
+    @State private var accountOpen = false
+    @State private var selectedPoint: RoutePoint?
     @State private var draftLocation: ZoneDraftCoordinate?
 
     init(model: RouteDiaryModel) {
@@ -115,6 +143,16 @@ struct DiaryMapView: View {
                                     .padding(5).background(.red, in: Circle())
                             }
                         }
+                        if showPins {
+                            ForEach(model.points.suffix(350)) { point in
+                                Annotation("記録地点", coordinate: point.coordinate) {
+                                    Button { selectedPoint = point } label: {
+                                        Image(systemName: "mappin.circle.fill")
+                                            .font(.system(size: 14)).foregroundStyle(.blue)
+                                    }.buttonStyle(.plain)
+                                }
+                            }
+                        }
                         ForEach(model.stays) { stay in
                             Annotation(stay.title.isEmpty ? "滞在" : stay.title, coordinate: stay.coordinate) {
                                 Image(systemName: "mappin.circle.fill")
@@ -124,34 +162,68 @@ struct DiaryMapView: View {
                         }
                         if let location = recorder.currentLocation {
                             Annotation("現在地", coordinate: location.coordinate) {
-                                Image(systemName: "location.circle.fill")
-                                    .font(.title2).foregroundStyle(.white, .blue)
-                                    .shadow(radius: 2)
+                                if useAvatar, let avatar = cloud.avatarImage {
+                                    Image(uiImage: avatar).resizable().scaledToFill()
+                                        .frame(width: 36, height: 36).clipShape(Circle())
+                                        .overlay(Circle().stroke(.blue, lineWidth: 2))
+                                } else {
+                                    Image(systemName: "location.circle.fill")
+                                        .font(.title2).foregroundStyle(.white, .blue)
+                                        .shadow(radius: 2)
+                                }
                             }
                         }
                     }
                     .mapStyle(satellite ? .imagery(elevation: .flat) : .standard(elevation: .flat))
                     .mapControls { MapCompass(); MapScaleView() }
                     .onTapGesture { point in
-                        guard chooseZone, let coord = proxy.convert(point, from: .local) else { return }
-                        draftLocation = ZoneDraftCoordinate(coordinate: coord)
-                        chooseZone = false
+                        if chooseZone, let coord = proxy.convert(point, from: .local) {
+                            draftLocation = ZoneDraftCoordinate(coordinate: coord)
+                            chooseZone = false
+                        }
                     }
+                    // 地図を長押しして除外エリア位置を指定できます。
+                    .simultaneousGesture(
+                        LongPressGesture(minimumDuration: 0.65)
+                            .sequenced(before: DragGesture(minimumDistance: 0))
+                            .onEnded { value in
+                                if case .second(true, let drag?) = value,
+                                   let coordinate = proxy.convert(drag.location, from: .local) {
+                                    draftLocation = ZoneDraftCoordinate(coordinate: coordinate)
+                                    chooseZone = false
+                                }
+                            }
+                    )
                 }
                 VStack(alignment: .trailing, spacing: 8) {
                     if chooseZone {
-                        Text("地図上の登録位置をタップ")
+                        Text(rd("地図上の登録位置をタップ"))
                             .font(.caption).bold().padding(8)
                             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 9))
                     }
                     Spacer()
                     control("square.3.layers.3d") { satellite.toggle() }
+                    Button {
+                        compassEnabled.toggle()
+                        recorder.setCompassEnabled(compassEnabled)
+                        if compassEnabled, let fix = recorder.currentLocation { focus(fix.coordinate) }
+                    } label: {
+                        Image("compass")
+                            .resizable().scaledToFit().frame(width: 37, height: 37)
+                            .clipShape(Circle())
+                            .overlay(Circle().stroke(compassEnabled ? .blue : .clear, lineWidth: 2))
+                            .frame(width: 42, height: 42)
+                            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+                    }.buttonStyle(.plain).accessibilityLabel("方位磁石の切り替え")
                     control("location") {
                         following = true
                         recorder.requestOneShotLocation()
                         if let fix = recorder.currentLocation { focus(fix.coordinate) }
                     }
-                    control("rectangle.expand.vertical") { fitAll() }
+                    control("rectangle.expand.vertical") {
+                        following = false; compassEnabled = false; recorder.setCompassEnabled(false)
+                        fitAll()
+                    }
                     control("plus.circle") { chooseZone.toggle() }
                 }
                 .padding(12)
@@ -164,6 +236,12 @@ struct DiaryMapView: View {
                 }
             }
             .onChange(of: model.selectedDay) { _, _ in fitAll() }
+            .onChange(of: recorder.headingDegrees) { _, heading in
+                if compassEnabled, let degrees = heading, let fix = recorder.currentLocation {
+                    camera = .camera(MapCamera(centerCoordinate: fix.coordinate, distance: 800,
+                                               heading: degrees, pitch: 0))
+                }
+            }
             .safeAreaInset(edge: .bottom) {
                 VStack(alignment: .leading, spacing: 6) {
                     HStack {
@@ -186,9 +264,37 @@ struct DiaryMapView: View {
                 .background(.regularMaterial)
             }
         }
-        .navigationTitle("RouteDiary iOS")
+        .navigationTitle("RouteDiary")
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button { accountOpen = true } label: {
+                    if let avatar = cloud.avatarImage {
+                        Image(uiImage: avatar).resizable().scaledToFill().frame(width: 30, height: 30).clipShape(Circle())
+                    } else { Image(systemName: "person.crop.circle").font(.title2) }
+                }.accessibilityLabel(rd("アカウント"))
+            }
+        }
+        .sheet(isPresented: $accountOpen) { AccountView() }
+        .sheet(item: $selectedPoint) { point in
+            NavigationStack {
+                Form {
+                    LabeledContent("記録日時", value: point.time.formatted())
+                    LabeledContent("緯度", value: String(format: "%.7f", point.latitude))
+                    LabeledContent("経度", value: String(format: "%.7f", point.longitude))
+                    LabeledContent("測位精度", value: String(format: "%.1f m", point.accuracy))
+                    LabeledContent("区間距離", value: String(format: "%.1f m", point.segment))
+                    if let speed = point.speed { LabeledContent("速度", value: String(format: "%.1f km/h", speed * 3.6)) }
+                    if point.gap { Text(rd("GPS欠損・除外区間の後のため距離加算なし")) }
+                }
+                .navigationTitle(rd("地点の情報"))
+                .toolbar { ToolbarItem(placement: .topBarTrailing) {
+                    Button("×") { selectedPoint = nil }
+                } }
+            }.presentationDetents([.medium, .large])
+        }
         .onAppear { if !model.points.isEmpty { fitAll() } }
+        .onDisappear { if compassEnabled { compassEnabled = false; recorder.setCompassEnabled(false) } }
         .sheet(item: $draftLocation) { location in
             ZoneFormView(coordinate: location.coordinate, onSave: { zone in model.setZone(zone) })
         }
@@ -239,12 +345,12 @@ struct PrivacyZonesView: View {
                         editing = PrivacyZone(title: "新しい除外エリア", latitude: fix.coordinate.latitude,
                                               longitude: fix.coordinate.longitude, radius: 100)
                     } else { addAtCurrentLocation = true; recorder.requestOneShotLocation() }
-                } label: { Label("現在地を除外エリアに追加", systemImage: "plus.circle") }
-                Text("地図上の任意位置からも追加できます（地図タブの＋）。")
+                } label: { Label(rd("現在地を除外エリアに追加"), systemImage: "plus.circle") }
+                Text(rd("地図上の任意位置からも追加できます（地図タブの＋）。"))
                     .font(.caption).foregroundStyle(.secondary)
             }
-            Section("登録済みエリア") {
-                if model.zones.isEmpty { Text("除外エリアはありません").foregroundStyle(.secondary) }
+            Section(rd("登録済みエリア")) {
+                if model.zones.isEmpty { Text(rd("除外エリアはありません")).foregroundStyle(.secondary) }
                 ForEach(model.zones) { zone in
                     Button {
                         editing = zone
@@ -261,11 +367,11 @@ struct PrivacyZonesView: View {
                 }
             }
             Section {
-                Text("除外エリア内ではGPS座標を履歴に保存しません。滞在時間のみ日別に集計します。")
+                Text(rd("除外エリア内ではGPS座標を履歴に保存しません。滞在時間のみ日別に集計します。"))
                     .font(.footnote).foregroundStyle(.secondary)
             }
         }
-        .navigationTitle("記録除外エリア")
+        .navigationTitle(rd("記録除外エリア"))
         .onChange(of: recorder.currentLocation?.timestamp) { _, _ in
             guard addAtCurrentLocation, let fix = recorder.currentLocation else { return }
             addAtCurrentLocation = false
@@ -295,19 +401,19 @@ struct ZoneFormView: View {
     var body: some View {
         NavigationStack {
             Form {
-                TextField("エリア名", text: $title)
+                TextField(rd("エリア名"), text: $title)
                 VStack(alignment: .leading) {
                     Text("半径 \(Int(radius)) m")
-                    Slider(value: $radius, in: 25...2000, step: 25)
+                    Slider(value: $radius, in: 10...5000, step: 10)
                 }
                 Text(String(format: "緯度 %.6f / 経度 %.6f", coordinate.latitude, coordinate.longitude))
                     .font(.caption).foregroundStyle(.secondary)
             }
-            .navigationTitle("除外エリアを設定")
+            .navigationTitle(rd("除外エリアを設定"))
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("キャンセル") { dismiss() } }
+                ToolbarItem(placement: .cancellationAction) { Button(rd("キャンセル")) { dismiss() } }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("保存") {
+                    Button(rd("保存")) {
                         onSave(PrivacyZone(id: existingZone?.id ?? 0, title: title.trimmingCharacters(in: .whitespaces),
                                            latitude: coordinate.latitude, longitude: coordinate.longitude, radius: radius))
                         dismiss()

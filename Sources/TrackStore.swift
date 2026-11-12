@@ -226,6 +226,107 @@ final class TrackStore {
         return hash
     }
 
+    // Cloud API v2.1 とAndroid版 OnlineSync のページ形式に合わせたローカル全件読み出し。
+    // DBオブジェクトは @MainActor 上でのみ参照し、ネットワーク応答中はアクセスしません。
+    func cloudPage(type: String, afterID: Int64, limit: Int = 200) throws -> (items: [[String: Any]], next: Int64) {
+        let capped = max(1, min(200, limit))
+        let sql: String
+        switch type {
+        case "points":
+            sql = "SELECT id,time,lat,lon,accuracy,segment,speed,peak_speed,gap FROM points WHERE id>? ORDER BY id LIMIT \(capped)"
+        case "stays":
+            sql = "SELECT id,anchor_time,start_time,end_time,lat,lon,title FROM stays WHERE id>? ORDER BY id LIMIT \(capped)"
+        case "max_speeds":
+            sql = "SELECT day_start,time,speed FROM max_speeds WHERE day_start>? ORDER BY day_start LIMIT \(capped)"
+        default: throw TrackStoreError.database("未対応のクラウドデータ種別")
+        }
+        let s = try prepare(sql)
+        defer { sqlite3_finalize(s) }
+        bind(s, 1, afterID)
+        var output: [[String: Any]] = []
+        var next = afterID
+        while sqlite3_step(s) == SQLITE_ROW {
+            next = sqlite3_column_int64(s, 0)
+            switch type {
+            case "points":
+                output.append([
+                    "time": sqlite3_column_int64(s, 1),
+                    "lat": sqlite3_column_double(s, 2), "lon": sqlite3_column_double(s, 3),
+                    "accuracy": sqlite3_column_double(s, 4), "segment": sqlite3_column_double(s, 5),
+                    "speed_mps": optionalDouble(s, 6) as Any? ?? NSNull(),
+                    "peak_speed_mps": optionalDouble(s, 7) as Any? ?? NSNull(),
+                    "gps_gap": sqlite3_column_int(s, 8) != 0
+                ])
+            case "stays":
+                output.append([
+                    "anchor_time": sqlite3_column_int64(s, 1),
+                    "start_time": sqlite3_column_int64(s, 2), "end_time": sqlite3_column_int64(s, 3),
+                    "lat": sqlite3_column_double(s, 4), "lon": sqlite3_column_double(s, 5),
+                    "title": textValue(s, 6)
+                ])
+            default:
+                output.append([
+                    "day_start": sqlite3_column_int64(s, 0),
+                    "time": sqlite3_column_int64(s, 1), "speed_mps": sqlite3_column_double(s, 2)
+                ])
+            }
+        }
+        return (output, next)
+    }
+
+    func importCloudRecords(_ type: String, items: [[String: Any]]) throws -> Int {
+        func number(_ json: [String: Any], _ key: String) throws -> Double {
+            guard let v = json[key] as? NSNumber, v.doubleValue.isFinite else {
+                throw TrackStoreError.database("クラウドから受信した \(key) が不正です")
+            }
+            return v.doubleValue
+        }
+        func millis(_ json: [String: Any], _ key: String) throws -> Int64 {
+            let value = try number(json, key)
+            guard value >= 0, value < 32_503_680_000_000 else {
+                throw TrackStoreError.database("クラウド日時 \(key) が不正です")
+            }
+            return Int64(value)
+        }
+        var added = 0
+        for json in items {
+            switch type {
+            case "points":
+                let timestamp = Date(milliseconds: try millis(json, "time"))
+                let lat = try number(json, "lat"), lon = try number(json, "lon")
+                let accuracy = try number(json, "accuracy"), segment = try number(json, "segment")
+                guard abs(lat) <= 90, abs(lon) <= 180, accuracy >= 0, accuracy <= 10_000,
+                      segment >= 0, segment <= 1_000_000 else { throw TrackStoreError.database("クラウド位置情報が不正です") }
+                let speed = (json["speed_mps"] as? NSNumber)?.doubleValue
+                let peak = (json["peak_speed_mps"] as? NSNumber)?.doubleValue
+                guard (speed == nil || (speed!.isFinite && speed! >= 0 && speed! <= 120)),
+                      (peak == nil || (peak!.isFinite && peak! >= 0 && peak! <= 120)) else {
+                    throw TrackStoreError.database("クラウド速度が不正です")
+                }
+                let point = RoutePoint(time: timestamp, latitude: lat, longitude: lon, accuracy: accuracy,
+                    segment: segment, speed: speed, peak: peak, gap: json["gps_gap"] as? Bool ?? false)
+                if try !containsPoint(point) { try add(point); added += 1 }
+            case "stays":
+                let anchor = Date(milliseconds: try millis(json, "anchor_time"))
+                let start = Date(milliseconds: try millis(json, "start_time"))
+                let end = Date(milliseconds: try millis(json, "end_time"))
+                let lat = try number(json, "lat"), lon = try number(json, "lon")
+                let title = json["title"] as? String ?? ""
+                guard end > start, anchor <= start, abs(lat) <= 90, abs(lon) <= 180, title.count <= 200 else {
+                    throw TrackStoreError.database("クラウド滞在情報が不正です")
+                }
+                try importStay(StayRecord(anchor: anchor, start: start, end: end, latitude: lat, longitude: lon, title: title))
+            case "max_speeds":
+                let timestamp = Date(milliseconds: try millis(json, "time"))
+                let speed = try number(json, "speed_mps")
+                guard speed >= 0, speed <= 120 else { throw TrackStoreError.database("クラウド最高速度が不正です") }
+                try updateDailyMax(time: timestamp, speed: speed)
+            default: throw TrackStoreError.database("未対応のクラウドデータ種別")
+            }
+        }
+        return added
+    }
+
     func deleteDay(_ day: Date) throws {
         let from = day.startOfLocalDay.unixMilliseconds, to = day.nextLocalDay.unixMilliseconds
         for (table, col) in [("points", "time"), ("stays", "start_time"), ("max_speeds", "day_start"), ("zone_stays", "start_time")] {
