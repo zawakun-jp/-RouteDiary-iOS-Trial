@@ -1,0 +1,60 @@
+name: Build unsigned RouteDiary IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out project
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: xcodebuild -version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate --spec project.yml
+
+      - name: Build iOS device app
+        run: |
+          set -o pipefail
+          xcodebuild -project RouteDiary.xcodeproj -scheme RouteDiary -configuration Release -sdk iphoneos \
+            -derivedDataPath "$PWD/build/DerivedData" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build | tee build.log
+
+      - name: Package unsigned IPA
+        run: |
+          set -eu
+          mkdir -p dist/Payload
+          APP="$PWD/build/DerivedData/Build/Products/Release-iphoneos/RouteDiary.app"
+          test -d "$APP"
+          cp -R "$APP" dist/Payload/RouteDiary.app
+          cd dist
+          zip -qry RouteDiary-iOS-trial-unsigned.ipa Payload
+          rm -rf Payload
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: RouteDiary-iOS-trial-unsigned
+          path: dist/RouteDiary-iOS-trial-unsigned.ipa
+          if-no-files-found: error
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: build.log
+          if-no-files-found: ignore
